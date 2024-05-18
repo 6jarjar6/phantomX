@@ -1,0 +1,33 @@
+name: Makefile CI
+
+on:
+  push:
+    branches: [ "master" ]
+  schedule:
+    - cron: "0 0 1 * *"
+  workflow_dispatch:
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build
+      run: make
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: phantom
+        path: |
+          bin/phantom-windows.exe
+          bin/phantom-windows-32bit.exe
+          bin/phantom-macos
+          bin/phantom-macos-arm8
+          bin/phantom-linux
+          bin/phantom-linux-arm5
+          bin/phantom-linux-arm6
+          bin/phantom-linux-arm7
+          bin/phantom-linux-arm8
