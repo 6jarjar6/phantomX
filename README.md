@@ -2,6 +2,8 @@
 
 # phantomX - a phantom fork
 
+### Download nightly builds at https://nightly.link/jschenke488/phantomX/workflows/makefile/main/phantom.zip
+
 Makes hosted Bedrock/MCPE servers show up as LAN servers, specifically for consoles.
 
 You can now play on remote servers (not Realms!) on your Xbox and PS4 with friends.
