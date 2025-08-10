@@ -17,7 +17,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-require github.com/tevino/abool v1.2.0
+require github.com/tevino/abool/v2 v2.1.0
 
 require (
 	github.com/mattn/go-colorable v0.1.13 // indirect
