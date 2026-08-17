@@ -6,7 +6,7 @@ require (
 	// github.com/golang/glog v1.0.0
 	github.com/libp2p/go-reuseport v0.4.0
 	github.com/rs/zerolog v1.35.1
-	github.com/stretchr/testify v1.11.1
+	github.com/stretchr/testify v1.12.0
 	github.com/tevino/abool/v2 v2.1.0
 )
 
@@ -22,5 +22,5 @@ require github.com/tevino/abool v1.2.0
 require (
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
-	github.com/stretchr/objx v0.5.2 // indirect
+	github.com/stretchr/objx v0.5.3 // indirect
 )
