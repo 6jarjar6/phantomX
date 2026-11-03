@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"os"
 	"regexp"
 	"time"
 
@@ -302,6 +303,19 @@ func (proxy *ProxyServer) processDataFromServer(remoteConn *net.UDPConn, client 
 
 		// Read error
 		if err != nil {
+			// A read timeout is TRANIENT: the shared conn's read deadline is
+			// advanced by the worker on every forwarded client packet (see
+			// SetReadDeadline below in processDataFromClients). A healthy but
+			// momentarily silent server triggers it (UDPs do not heartbeat),
+			// so it must not tear the connection down or mark the server
+			// offline. Reset the deadline (block infinitely again) and keep
+			// waiting.
+			if os.IsTimeout(err) {
+				log.Warn().Msgf("Server read timed out (transient); keeping connection: %v", err)
+				_ = remoteConn.SetReadDeadline(time.Time{})
+				continue
+			}
+
 			log.Warn().Msgf("%v", err)
 
 			// Mark offline if the failure indicates a connectivity loss
