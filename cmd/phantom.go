@@ -46,6 +46,14 @@ func main() {
 	bindAddressString = *bindArg
 	serverAddressString = *serverArg
 	idleTimeout := time.Duration(*timeoutArg) * time.Second
+
+	// Validate the port before narrowing to uint16: a user-supplied port
+	// above 65535 would silently wrap around (70000 -> 4464).
+	if *bindPortArg < 0 || *bindPortArg > 65535 {
+		fmt.Printf("Invalid -bind_port %d: must be between 0 and 65535\n", *bindPortArg)
+		flag.Usage()
+		os.Exit(1)
+	}
 	bindPortInt = uint16(*bindPortArg)
 
 	logLevel := zerolog.InfoLevel

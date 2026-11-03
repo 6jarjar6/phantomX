@@ -78,6 +78,14 @@ func New(prefs ProxyPrefs) (*ProxyServer, error) {
 		return nil, fmt.Errorf("Invalid server address: %s", err)
 	}
 
+	// Reject a missing port outright: a remote address with port 0 would
+	// silently "connect" to an unreachable address (UDP has no handshake,
+	// so this would never error), and phantom would run degraded without
+	// saying so.
+	if remoteServerAddress.Port == 0 {
+		return nil, fmt.Errorf("invalid server address %q: no port specified (use host:port, e.g. 192.168.1.20:19132)", prefs.RemoteServer)
+	}
+
 	return &ProxyServer{
 		bindAddress,
 		bindPort,
