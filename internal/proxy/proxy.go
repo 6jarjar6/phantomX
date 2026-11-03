@@ -2,7 +2,7 @@ package proxy
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"regexp"
 	"time"
@@ -29,7 +29,7 @@ type ProxyServer struct {
 	clientMap           *clientmap.ClientMap
 	prefs               ProxyPrefs
 	dead                *abool.AtomicBool
-	serverOffline       bool
+	serverOffline       *abool.AtomicBool
 }
 
 type ProxyPrefs struct {
@@ -42,8 +42,13 @@ type ProxyPrefs struct {
 	NumWorkers   uint
 }
 
-var randSource = rand.NewSource(time.Now().UnixNano())
-var serverID = randSource.Int63()
+// serverID is a unique per-instance identifier advertised to clients; it must
+// be freshly derived on every phantom start so restarting doesn't confuse
+// clients that remember the previous ID. Safe under concurrent use:
+// math/rand/v2's top-level functions are thread-safe. (62-bit range —
+// collision probability is negligible, and negative values are impossible
+// unlike rand.Int64().)
+var serverID = rand.Int64N(1 << 62)
 var offlineErrorRegex = regexp.MustCompile("(timeout)|(connection refused)")
 
 func New(prefs ProxyPrefs) (*ProxyServer, error) {
@@ -51,7 +56,7 @@ func New(prefs ProxyPrefs) (*ProxyServer, error) {
 
 	// Randomize port if not provided
 	if bindPort == 0 {
-		bindPort = (uint16(randSource.Int63()) % 14000) + 50000
+		bindPort = uint16(rand.IntN(14000)) + 50000
 	}
 
 	// Format full bind address with port
@@ -77,7 +82,7 @@ func New(prefs ProxyPrefs) (*ProxyServer, error) {
 		clientmap.New(prefs.IdleTimeout, idleCheckInterval),
 		prefs,
 		abool.New(),
-		false,
+		abool.New(),
 	}, nil
 }
 
@@ -217,7 +222,7 @@ func (proxy *ProxyServer) processDataFromClients(listener net.PacketConn, packet
 	if packetID := data[0]; packetID == proto.UnconnectedPingID {
 		log.Info().Msgf("Received LAN ping from client: %s", client.String())
 
-		if proxy.serverOffline {
+		if proxy.serverOffline.IsSet() {
 			replyBuffer := proto.OfflinePong
 			replyBytes := proxy.rewriteUnconnectedPong(replyBuffer.Bytes())
 
@@ -249,12 +254,12 @@ func (proxy *ProxyServer) processDataFromServer(remoteConn *net.UDPConn, client 
 		if err != nil {
 			log.Warn().Msgf("%v", err)
 
+			// Mark offline if the failure indicates a connectivity loss
+			// (deduplicated: log warn only on the false->true transition)
 			offlineError := offlineErrorRegex.MatchString(err.Error())
-
-			if offlineError && !proxy.serverOffline {
-				log.Warn().Msgf("Server seems to be offline :(")
-				log.Warn().Msgf("We'll keep trying to connect...")
-				proxy.serverOffline = true
+			if offlineError && proxy.serverOffline.SetToIf(false, true) {
+				log.Warn().Msg("Server seems to be offline :(")
+				log.Warn().Msg("We'll keep trying to connect...")
 			}
 
 			break
@@ -265,9 +270,10 @@ func (proxy *ProxyServer) processDataFromServer(remoteConn *net.UDPConn, client 
 			continue
 		}
 
-		if proxy.serverOffline {
+		// Clear the flag if the server came back online; log only on the
+		// true->false transition (i.e., we recover from the offline state)
+		if proxy.serverOffline.SetToIf(true, false) {
 			log.Info().Msgf("Server is back online!")
-			proxy.serverOffline = false
 		}
 
 		// Resize data to byte count from 'read'
