@@ -125,6 +125,9 @@ func (proxy *ProxyServer) Start() error {
 		// a safe cast, I promise
 		proxy.server = server.(*net.UDPConn)
 	} else {
+		// Don't leak the ping listeners (and their readLoop goroutines)
+		// that were already started — shut them down on this failure path.
+		proxy.shutdownListeners()
 		return err
 	}
 
@@ -138,12 +141,16 @@ func (proxy *ProxyServer) Start() error {
 }
 
 func (proxy *ProxyServer) Close() {
-	log.Info().Msgf("Stopping proxy server")
+	log.Info().Msg("Stopping proxy server")
 
-	// Stop UDP listeners
-	proxy.server.Close()
-	proxy.pingServer.Close()
-
+	// Shut down UDP listeners (nil-guarded: Start may fail before every
+	// listener is assigned, and Close is still called on interrupt)
+	if proxy.server != nil {
+		proxy.server.Close()
+	}
+	if proxy.pingServer != nil {
+		proxy.pingServer.Close()
+	}
 	if proxy.pingServerV6 != nil {
 		proxy.pingServerV6.Close()
 	}
@@ -155,13 +162,38 @@ func (proxy *ProxyServer) Close() {
 	proxy.dead.Set()
 }
 
-func (proxy *ProxyServer) startWorkers(listener net.PacketConn) {
-	log.Info().Msgf("Starting %d workers", proxy.prefs.NumWorkers)
+// shutdownListeners reverses Start's partial-setup on the failure path so
+// callers don't leak already-bound listeners or the readLoop goroutines
+// attached to them. Setting dead makes the in-flight readLoops exit.
+func (proxy *ProxyServer) shutdownListeners() {
+	proxy.dead.Set()
+	if proxy.pingServerV6 != nil {
+		proxy.pingServerV6.Close()
+		proxy.pingServerV6 = nil
+	}
+	if proxy.pingServer != nil {
+		proxy.pingServer.Close()
+		proxy.pingServer = nil
+	}
+}
 
-	for i := uint(0); i < proxy.prefs.NumWorkers; i++ {
-		if i < proxy.prefs.NumWorkers-1 {
+func (proxy *ProxyServer) startWorkers(listener net.PacketConn) {
+	// Clamp to at least one worker: with NumWorkers == 0, zero workers
+	// would be launched and Start would return a zombie proxy that
+	// listens but never forwards packets.
+	numWorkers := proxy.prefs.NumWorkers
+	if numWorkers == 0 {
+		numWorkers = 1
+	}
+
+	log.Info().Msgf("Starting %d workers", numWorkers)
+
+	for i := uint(0); i < numWorkers; i++ {
+		if i < numWorkers-1 {
 			go proxy.readLoop(listener)
 		} else {
+			// Last worker runs in the current goroutine, so Start()
+			// blocks until the proxy is shut down.
 			proxy.readLoop(listener)
 		}
 	}

@@ -72,14 +72,18 @@ func main() {
 
 	if err != nil {
 		fmt.Printf("Failed to init server: %s\n", err)
-		return
+		os.Exit(1)
 	}
 
 	// Watch for CTRL + C
 	watchForInterrupt(proxyServer)
 
-	if err := proxyServer.Start(); err != nil {
+	err = proxyServer.Start()
+	// Start blocks (last worker runs in the calling goroutine); if the
+	// bind/setup fails, exit non-zero so supervisors/scripts can detect it.
+	if err != nil {
 		fmt.Printf("Failed to start server: %s\n", err)
+		os.Exit(1)
 	}
 }
 
