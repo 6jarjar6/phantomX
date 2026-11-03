@@ -3,6 +3,7 @@ package proto
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -12,6 +13,17 @@ import (
 
 var UnconnectedPingID byte = 0x01
 var UnconnectedPongID byte = 0x1C
+
+// MinHeaderSize is the minimum size of a valid unconnected ping/pong header:
+// 1 (id) + 8 (timestamp) + 8 (GUID) + 16 (magic) + 2 (payload length).
+const MinHeaderSize = 35
+
+// Sentinel errors for malformed packets, so callers can distinguish validation
+// failures from transport faults.
+var (
+	ErrShortHeader   = errors.New("short header: expected at least 35 bytes")
+	ErrTruncatedPong = errors.New("truncated pong: declared length exceeds available bytes")
+)
 
 type UnconnectedPing struct {
 	PingTime []byte
@@ -55,39 +67,28 @@ var dupeSemicolonRegex = regexp.MustCompile(";{2,}$")
 
 func ReadUnconnectedPing(in []byte) (reply *UnconnectedPing, err error) {
 	reply = &UnconnectedPing{}
-	buf := bytes.NewBuffer(in)
+	if len(in) < MinHeaderSize {
+		return nil, ErrShortHeader
+	}
 
-	// Packet ID
-	buf.ReadByte()
-
+	// Header layout: id(1) | ts(8) | guid(8) | magic(16) | length(2)
+	// Copies isolate the caller's buffer from the parsed struct.
 	reply.PingTime = make([]byte, 8)
-	if _, err := buf.Read(reply.PingTime); err != nil {
-		return nil, err
-	}
-
+	copy(reply.PingTime, in[1:9])
 	reply.ID = make([]byte, 8)
-	if _, err := buf.Read(reply.ID); err != nil {
-		return nil, err
-	}
-
+	copy(reply.ID, in[9:17])
 	reply.Magic = make([]byte, 16)
-	if _, err := buf.Read(reply.Magic); err != nil {
-		return nil, err
+	copy(reply.Magic, in[17:33])
+
+	pongLen := int(binary.BigEndian.Uint16(in[33:35]))
+
+	// Fail-fast: a declared payload length longer than what the packet
+	// actually contains is a malformed packet, not a partial read.
+	if pongLen > len(in)-MinHeaderSize {
+		return nil, ErrTruncatedPong
 	}
 
-	pongLenBytes := make([]byte, 2)
-	if _, err := buf.Read(pongLenBytes); err != nil {
-		return nil, err
-	}
-
-	pongLen := binary.BigEndian.Uint16(pongLenBytes)
-
-	pongDataBytes := make([]byte, pongLen)
-	if _, err := buf.Read(pongDataBytes); err != nil {
-		return nil, err
-	}
-
-	reply.Pong = readPong(string(pongDataBytes))
+	reply.Pong = readPong(string(in[35 : 35+pongLen]))
 
 	return
 }

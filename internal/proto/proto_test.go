@@ -56,33 +56,21 @@ func TestReadUnconnectedPing(t *testing.T) {
 	assert.Equal(t, "p6", reply.Pong.Port6)
 }
 
-// Truncation behavior: most header cuts fail, but the reader is LENIENT
-// with partial reads — a cut mid-way through the length prefix still
-// parses (yielding a possibly smaller length), and a cut that supplies
-// fewer than the declared payload bytes is accepted without error.
-// Pins the exact outcome per cutoff for a 38-byte packet (declared len 4):
+// Strict truncation behavior: the decoder rejects short headers (<35 bytes)
+// and declared payload lengths longer than the bytes present.
+// Per cutoff for a 39-byte packet (prefix fixed at 0,4, payload at [35:39]):
 //
-//	0-33  -> error (header broken at some stage)
-//	34    -> passes (partial length prefix; derived length from 1 byte)
-//	35    -> error (valid length prefix, zero payload bytes available)
-//	36-38 -> passes (partial/full payload accepted)
+//	0-34  -> error (short header)
+//	35-38 -> error (declared length exceeds available bytes)
+//	39    -> passes (full payload)
 func TestReadUnconnectedPingTruncated(t *testing.T) {
-	full := make([]byte, 38)
+	full := make([]byte, 39)
 	full[0] = 0x01
 	copy(full[33:], []byte{0, 4})
 	copy(full[35:], "MOTP")
 
 	wantErr := func(cutoff int) bool {
-		switch {
-		case cutoff <= 33:
-			return true
-		case cutoff == 34:
-			return false
-		case cutoff == 35:
-			return true
-		default:
-			return false
-		}
+		return cutoff < 39
 	}
 
 	for cutoff := 0; cutoff <= len(full); cutoff++ {
@@ -93,10 +81,22 @@ func TestReadUnconnectedPingTruncated(t *testing.T) {
 			assert.NoError(t, err, "cutoff %d should be tolerated", cutoff)
 		}
 	}
+
+	// Sentinel discrimination: short header vs truncated payload.
+	_, err := ReadUnconnectedPing(full[:34])
+	assert.ErrorIs(t, err, ErrShortHeader)
+	_, err = ReadUnconnectedPing(full[:36])
+	assert.ErrorIs(t, err, ErrTruncatedPong)
+
+	// A complete header with a zero-length declaration is valid on its own.
+	zeroLen := make([]byte, MinHeaderSize)
+	zeroLen[0] = 0x01 // prefix bytes [33:35] are already 0
+	_, err = ReadUnconnectedPing(zeroLen)
+	assert.NoError(t, err)
 }
 
-// Leniency: a declared length longer than the payload actually present is
-// accepted (partial read), not detected. Documenting current behavior.
+// Strictness: a declared length longer than the payload actually present is
+// rejected, not silently accepted.
 func TestReadUnconnectedPingDeclaredLengthTooLong(t *testing.T) {
 	pingTime := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
 	clientID := [8]byte{9, 10, 11, 12, 13, 14, 15, 16}
@@ -104,12 +104,13 @@ func TestReadUnconnectedPingDeclaredLengthTooLong(t *testing.T) {
 		0xFD, 0xFD, 0xFD, 0xFD, 0x12, 0x34, 0x56, 0x78}
 
 	packet := buildPing(0x01, pingTime, clientID, magic, "AB")
-	// Claim 10 bytes of payload but only supply 2.
-	packet[31] = byte(0)
-	packet[32] = byte(10)
+	// buildPing places the length prefix at [33:35]; claim 10 bytes of
+	// payload but only supply 2.
+	packet[33] = byte(0)
+	packet[34] = byte(10)
 
 	_, err := ReadUnconnectedPing(packet)
-	assert.NoError(t, err)
+	assert.ErrorIs(t, err, ErrTruncatedPong)
 }
 
 func TestBuildLayout(t *testing.T) {
@@ -222,30 +223,23 @@ func TestOfflinePongWireFormat(t *testing.T) {
 	assert.Equal(t, len(raw)-headerLen, declaredLen)
 }
 
-// Empty payload edge: Build of all-zero fields must still emit a valid
-// header with a consistent length prefix, and Read must reject a
-// zero-length-declared payload buffer... actually a zero-length pong
-// payload is legal (declare 0, supply 0).
+// Empty payload edge: an all-empty struct still yields a 1-byte payload
+// (the enforced trailing ';' via ""), and a zero-length declaration is legal.
 func TestZeroLengthPongPayload(t *testing.T) {
 	zeroTime := [8]byte{}
 	zeroID := [8]byte{}
 	magic := [16]byte{0, 0xFF, 0xFF, 0, 0xFE, 0xFE, 0xFE, 0xFE,
 		0xFD, 0xFD, 0xFD, 0xFD, 0x12, 0x34, 0x56, 0x78}
 
-	// An all-empty struct still yields a 1-byte payload: the enforced
-	// trailing ';' (empty join -> "" -> "%s;" -> ";").
-	built := buildPing(0x01, zeroTime, zeroID, magic, "")
-	// Replace the declared length (currently 0 from empty payload) with the
-	// actual minimal payload the wire writer demands.
-	built[31], built[32] = 0, 1
-
-	reply, err := ReadUnconnectedPing(built)
+	// A 1-byte payload (";") with matching length prefix must parse.
+	minimal := buildPing(0x01, zeroTime, zeroID, magic, ";")
+	reply, err := ReadUnconnectedPing(minimal)
 	assert.NoError(t, err)
 	assert.Empty(t, reply.Pong.MOTD)
 
-	// Reading a header with declared-len 0 and no payload is also valid.
+	// A zero-length declaration with zero payload bytes is also valid
+	// (buildPing already emits a 0/0 prefix for empty payload).
 	empty := buildPing(0x01, zeroTime, zeroID, magic, "")
-	empty[31], empty[32] = 0, 0
 	reply2, err := ReadUnconnectedPing(empty)
 	assert.NoError(t, err)
 	assert.Empty(t, reply2.Pong.MOTD)
