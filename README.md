@@ -1,4 +1,4 @@
-[![Downloads](https://img.shields.io/github/downloads/6jarjar6/phantom/total)](https://github.com/6jarjar6/phantom/releases)
+[![Downloads](https://img.shields.io/github/downloads/6jarjar6/phantomX/total)](https://github.com/6jarjar6/phantomX/releases)
 
 # phantomX - a phantom fork
 
@@ -14,7 +14,7 @@ phantom is a command line application with no GUI (yet). See the usage section b
 
 [Download](https://github.com/6jarjar6/phantomX/releases) phantomX from this repo releases page.
 
-[Download](https://github.com/jhead/phantom/releases) phantom from jhead's repo releases page.
+[Download](https://github.com/jhead/phantom/releases) phantom (the original) from jhead's repo releases page.
 
 **macOS / Linux**
 
@@ -50,7 +50,9 @@ Options:
   -server string
     	Required: Bedrock/MCPE server IP address and port (ex: 1.2.3.4:19132)
   -timeout int
-    	Optional: Seconds to wait before cleaning up a disconnected client (default 60)
+   	Optional: Seconds to wait before cleaning up a disconnected client (default 60)
+  -workers uint
+   	Optional: Number of workers, useful for tweaking performance (experimental) (default 1)
 ```
 
 **Example**
