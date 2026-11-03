@@ -19,6 +19,12 @@ const maxMTU = 1472
 
 var idleCheckInterval = 5 * time.Second
 
+// errorBackoff paces retries in readLoop after a transient processing error,
+// guarding against a hot spin if the listener ever returns without blocking
+// (e.g., closed concurrently). The normal path — a blocking ReadFrom — is
+// unaffected.
+var errorBackoff = 100 * time.Millisecond
+
 type ProxyServer struct {
 	bindAddress         *net.UDPAddr
 	boundPort           uint16
@@ -209,7 +215,11 @@ func (proxy *ProxyServer) readLoop(listener net.PacketConn) {
 	for !proxy.dead.IsSet() {
 		err := proxy.processDataFromClients(listener, packetBuffer)
 		if err != nil {
+			// Back off on error to avoid hot-spinning on a sustained
+			// failure (e.g. a flap in remote connection establishment).
+			// The happy path (err == nil) is unaffected — no sleep.
 			log.Warn().Msgf("Error while processing client data: %s", err)
+			time.Sleep(errorBackoff)
 		}
 	}
 
