@@ -190,6 +190,19 @@ func (tc *testClient) takePong(timeout time.Duration) (pkg *proto.UnconnectedPin
 
 func (tc *testClient) shut() { tc.conn.Close() }
 
+// drainAny discards stray pong replies queued by bringUp, so the
+// subsequent takePong provably reflects a response from the surviving
+// connection (not a leftover from the bootstrap traffic).
+func (tc *testClient) drainAny() {
+	for {
+		select {
+		case <-tc.packets:
+		default:
+			return
+		}
+	}
+}
+
 // bringUp starts a proxy aimed at the fake server and waits (polling with
 // pings) until it demonstrates life by forwarding traffic.
 func bringUp(t *testing.T, fs *fakeServer, prefs ProxyPrefs) (*ProxyServer, *testClient) {
@@ -329,13 +342,14 @@ func TestTransientReadTimeoutKeepsConnectionAlive(t *testing.T) {
 		return pr.clientMap.Len()
 	}
 
-	// Repro the production false positive: silence the server, then
-	// forward a ping — the worker sets the shared conn's deadline
-	// (+250ms), the fake never answers, and the reader's pending
+	// Reconstruct the production false positive: silence the server, then
+	// forward a ping — the worker sets the deadline on the shared conn
+	// (+250ms), the fake responds nothing, and the reader's waiting
 	// ReadFrom expires with "i/o timeout".
 	fs.SetReply(false)
+	tc.drainAny() // Discard the stray pong from bringUp, so the survivorship legs aren't contaminated
 	tc.sendPing(dstFor(pr), 2)
-	time.Sleep(400 * time.Millisecond) // let the deadline elapse
+	time.Sleep(400 * time.Millisecond) // Allow the deadline to expire
 
 	// Old code: "i/o timeout" matches the regex -> connection torn down
 	// and server marked OFFLINE. Fixed code: transient -> connection kept.
@@ -444,6 +458,20 @@ func TestMultiWorkerStillProxies(t *testing.T) {
 	pkg, ok := tc.takePong(3 * time.Second)
 	require.True(t, ok, "expected pong via a 2-worker proxy")
 	assert.Equal(t, "fake motd", pkg.Pong.MOTD)
+
+	// Second phase: NumWorkers:0 hits the clamp (0 → 1 worker). Without
+	// the clamp, a zero-worker proxy is a zombie that never forwards
+	// — this case is what actually pins the clamp branch.
+	fs2 := startFakeServer(t, pickFreePort(t))
+	pr2, tc2 := bringUp(t, fs2, ProxyPrefs{
+		IdleTimeout: 20 * time.Second,
+		NumWorkers:  0,
+	})
+	tc2.drainAny()
+	tc2.sendPing(dstFor(pr2), 1)
+	pkg2, ok := tc2.takePong(3 * time.Second)
+	require.True(t, ok, "expected pong via a clamped-to-one-worker proxy")
+	assert.Equal(t, "fake motd", pkg2.Pong.MOTD)
 }
 
 // ---------------------------------------------------------------------------
