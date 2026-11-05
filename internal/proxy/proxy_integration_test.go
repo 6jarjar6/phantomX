@@ -524,3 +524,113 @@ func TestStartupBindFailureReleasesResources(t *testing.T) {
 	// Close on a failed Start must be safe (nil guards, no panic).
 	pr.Close()
 }
+
+// ---------------------------------------------------------------------------
+// Cycle 7 — IPv6 dual-stack: with EnableIPv6, Start() binds an additional
+// IPv6 ping listener (port 19133 default) alongside the v4 one, the proxy
+// still proxies normally, and Close() tears the IPv6 listener down without
+// panicking.
+// ---------------------------------------------------------------------------
+
+func TestIPv6DualStackBindsAndProxies(t *testing.T) {
+	fs := startFakeServer(t, pickFreePort(t))
+
+	pr, err := New(ProxyPrefs{
+		BindAddress:  "127.0.0.1",
+		BindPort:     uint16(pickFreePort(t)),
+		RemoteServer: fs.Address().String(),
+		IdleTimeout:  20 * time.Second,
+		EnableIPv6:   true,
+		PingPort:     uint16(pickFreePort(t)),
+		PingPortV6:   uint16(pickFreePort(t)),
+	})
+	require.NoError(t, err)
+
+	// Start() is blocking (last worker runs in-goroutine); surface a fast
+	// early bind failure directly instead of letting it hang.
+	startErr := make(chan error, 1)
+	go func() { startErr <- pr.Start() }()
+	t.Cleanup(func() { pr.Close() })
+	waitForReady(t, pr, "IPv6 Start() failed")
+	select {
+	case err := <-startErr:
+		require.FailNow(t, "IPv6 Start() exited unexpectedly: "+err.Error())
+	default:
+	}
+
+	// The IPv6 ping listener must have bound (Start's EnableIPv6 path),
+	// and the v4 listener alongside it.
+	require.NotNil(t, pr.pingServerV6, "IPv6 ping listener must bind when EnableIPv6 is set")
+	require.NotNil(t, pr.pingServer, "v4 ping listener must also bind")
+
+	// End-to-end: a normal ping over the v4 port still proxies through an
+	// IPv6-enabled proxy.
+	tc := startTestClient(t)
+	tc.drainAny()
+	tc.sendPing(dstFor(pr), 1)
+	pkg, ok := tc.takePong(3 * time.Second)
+	require.True(t, ok, "expected pong over IPv6-enabled proxy")
+	assert.Equal(t, "fake motd", pkg.Pong.MOTD)
+
+	// Close must tear down the IPv6 listener without panicking.
+	pr.Close()
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 8 — offline pong: when the backend is marked offline, a client LAN
+// ping is answered with the proxy's canned offline pong (not the real
+// server's), so the console shows "server offline" instead of hanging.
+// ---------------------------------------------------------------------------
+
+func TestOfflinePongServedWhenServerDown(t *testing.T) {
+	// Fake won't respond, so the ONLY pong the client can receive is the
+	// proxy's canned offline pong — making the oracle deterministic.
+	fs := startFakeServer(t, pickFreePort(t))
+	fs.SetReply(false)
+
+	pr, tc := bringUp(t, fs, ProxyPrefs{IdleTimeout: 20 * time.Second})
+
+	// Simulate the backend being detected offline.
+	pr.serverOffline.Set()
+
+	tc.drainAny()
+	tc.sendPing(dstFor(pr), 1)
+	pkg, ok := tc.takePong(3 * time.Second)
+	require.True(t, ok, "expected offline pong from the proxy")
+
+	// The offline pong is a distinctive, canned packet — verify it is the
+	// offline one, not the fake server's real pong.
+	assert.Equal(t, "phantom §cServer offline", pkg.Pong.MOTD)
+	assert.Equal(t, "390", pkg.Pong.ProtocolVersion)
+	assert.Equal(t, "1.14.60", pkg.Pong.Version)
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 9 — server recovery: once the backend responds again, the offline
+// flag is cleared and traffic flows through normally.
+// ---------------------------------------------------------------------------
+
+func TestServerRecoveryClearsOfflineFlag(t *testing.T) {
+	fs := startFakeServer(t, pickFreePort(t))
+
+	pr, tc := bringUp(t, fs, ProxyPrefs{IdleTimeout: 20 * time.Second})
+
+	// Mark the backend offline, then have it come back.
+	pr.serverOffline.Set()
+
+	// The fake resumes; a ping makes it respond, which the proxy reads on
+	// the server-reading goroutine and uses to clear the offline flag.
+	fs.SetReply(true)
+	tc.drainAny()
+	tc.sendPing(dstFor(pr), 1)
+
+	// The client receives the server's real pong (proving recovery forwarded
+	// live traffic, not the canned offline pong).
+	waitFor(t, "recovery pong", 3*time.Second, func() bool {
+		p := tc.tryTakePong()
+		return p != nil && p.Pong.MOTD == "fake motd"
+	})
+
+	// Recovery cleared the offline flag.
+	assert.False(t, pr.serverOffline.IsSet(), "server must clear offline state after responding")
+}
