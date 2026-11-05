@@ -97,6 +97,14 @@ func (cm *ClientMap) Delete(clientAddr net.Addr) {
 	cm.mutex.Unlock()
 }
 
+// Len returns the number of live client connections currently tracked.
+// Useful for diagnostics and monitoring (how many consoles are proxied).
+func (cm *ClientMap) Len() int {
+	cm.mutex.RLock()
+	defer cm.mutex.RUnlock()
+	return len(cm.clients)
+}
+
 // Get gets or creates a new UDP connection to the remote server and stores it
 // in a map, matching clients to remote server connections. This way, we keep one
 // UDP connection open to the server for each client. The handler parameter is
