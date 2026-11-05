@@ -289,6 +289,7 @@ func TestHappyPath(t *testing.T) {
 	})
 	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(pr.boundPort)}
 
+	tc.drainAny() // Discard stray pongs from bringUp bootstrap traffic
 	tc.sendPing(dst, 1)
 	pkg, ok := tc.takePong(3 * time.Second)
 	require.True(t, ok, "expected a pong from the fake server via the proxy")
@@ -349,7 +350,14 @@ func TestTransientReadTimeoutKeepsConnectionAlive(t *testing.T) {
 	fs.SetReply(false)
 	tc.drainAny() // Discard the stray pong from bringUp, so the survivorship legs aren't contaminated
 	tc.sendPing(dstFor(pr), 2)
-	time.Sleep(400 * time.Millisecond) // Allow the deadline to expire
+	// Wait until the +serverReadDelay read deadline has actually elapsed.
+	// Polling (rather than a fixed sleep) lets a heavily-loaded host let
+	// the deadline slip past without weakening the transient-timeout
+	// oracle — a 400ms margin covers plausible worker-processing delay.
+	deadline := time.Now().Add(serverReadDelay + 400*time.Millisecond)
+	for time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	// Old code: "i/o timeout" matches the regex -> connection torn down
 	// and server marked OFFLINE. Fixed code: transient -> connection kept.
