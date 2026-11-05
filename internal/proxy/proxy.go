@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"sync"
 	"time"
 
 	"github.com/jhead/phantom/internal/clientmap"
@@ -16,15 +17,32 @@ import (
 	reuse "github.com/libp2p/go-reuseport"
 )
 
+// testKnobsMu guards the tunable duration knobs (serverReadDelay) that
+// integration tests compress (milliseconds) to exercise production
+// windows. Workers read them concurrently, hence the lock.
+var testKnobsMu sync.Mutex
+
 const maxMTU = 1472
 
 var idleCheckInterval = 5 * time.Second
 
-// errorBackoff paces retries in readLoop after a transient processing error,
-// guarding against a hot spin if the listener ever returns without blocking
-// (e.g., closed concurrently). The normal path — a blocking ReadFrom — is
-// unaffected.
+// errorBackoff paces retries in readLoop after a transient processing
+// error, guarding against a hot spin if the listener ever returns without
+// blocking (e.g., closed concurrently). The normal path — a blocking
+// ReadFrom — is unaffected.
 var errorBackoff = 100 * time.Millisecond
+
+// serverReadDelay caps how long a pending read from the server may sit
+// before it is released. Promoted from an inline literal so integration
+// tests can compress it (milliseconds instead of 5s).
+var serverReadDelay = 5 * time.Second
+
+// setServerReadDelay updates the knob under the lock (test hook).
+func setServerReadDelay(d time.Duration) {
+	testKnobsMu.Lock()
+	serverReadDelay = d
+	testKnobsMu.Unlock()
+}
 
 type ProxyServer struct {
 	bindAddress         *net.UDPAddr
@@ -47,6 +65,12 @@ type ProxyPrefs struct {
 	EnableIPv6   bool
 	RemovePorts  bool
 	NumWorkers   uint
+	// PingPort/PingPortV6 are the ports consoles broadcast pings to.
+	// Zero selects an ephemeral port (useful for tests); the default
+	// deployment relies on the conventional 19132/19133 (see
+	// Start()).
+	PingPort   uint16
+	PingPortV6 uint16
 }
 
 // serverID is a unique per-instance identifier advertised to clients; it must
@@ -102,10 +126,16 @@ func New(prefs ProxyPrefs) (*ProxyServer, error) {
 }
 
 func (proxy *ProxyServer) Start() error {
-	// Bind to 19132 on all addresses to receive broadcasted pings
-	// Sets SO_REUSEADDR et al to support multiple instances of phantom
-	log.Info().Msgf("Binding ping server to port 19132")
-	if pingServer, err := reuse.ListenPacket("udp4", ":19132"); err == nil {
+	// Bind to the console ping port on all addresses to receive broadcasted pings.
+	// Sets SO_REUSEADDR et al to support multiple instances of phantom.
+	// Port 0 in prefs keeps the conventional 19132 (deployment-default);
+	// a non-zero port is honoured as-is (tests use picked ports).
+	pingPort := proxy.prefs.PingPort
+	if pingPort == 0 {
+		pingPort = 19132
+	}
+	log.Info().Msgf("Binding ping server to port %d", pingPort)
+	if pingServer, err := reuse.ListenPacket("udp4", fmt.Sprintf(":%d", pingPort)); err == nil {
 		proxy.pingServer = pingServer
 
 		// Start proxying ping packets from the broadcast listener
@@ -115,10 +145,15 @@ func (proxy *ProxyServer) Start() error {
 		return err
 	}
 
-	// Minecraft automatically broadcasts on port 19133 to the local IPv6 network
+	// Minecraft also broadcasts pings to the IPv6 console port
+	// (19133 by default); EnableIPv6 opts into it.
 	if proxy.prefs.EnableIPv6 {
-		log.Info().Msgf("Binding IPv6 ping server to port 19133")
-		if pingServerV6, err := reuse.ListenPacket("udp6", ":19133"); err == nil {
+		v6Port := proxy.prefs.PingPortV6
+		if v6Port == 0 {
+			v6Port = 19133
+		}
+		log.Info().Msgf("Binding IPv6 ping server to port %d", v6Port)
+		if pingServerV6, err := reuse.ListenPacket("udp6", fmt.Sprintf(":%d", v6Port)); err == nil {
 			proxy.pingServerV6 = pingServerV6
 
 			// Start proxying ping packets from the broadcast listener
@@ -267,8 +302,12 @@ func (proxy *ProxyServer) processDataFromClients(listener net.PacketConn, packet
 		return err
 	}
 
-	// Wait 5 seconds for the server to respond to whatever we sent, or else timeout
-	_ = serverConn.SetReadDeadline(time.Now().Add(time.Second * 5))
+	// Give the server up to serverReadDelay to respond to whatever we sent
+	// before the read is considered stalled.
+	testKnobsMu.Lock()
+	delay := serverReadDelay
+	testKnobsMu.Unlock()
+	_ = serverConn.SetReadDeadline(time.Now().Add(delay))
 
 	if packetID := data[0]; packetID == proto.UnconnectedPingID {
 		log.Info().Msgf("Received LAN ping from client: %s", client.String())
