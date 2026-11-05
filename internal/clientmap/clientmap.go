@@ -58,14 +58,16 @@ func (cm *ClientMap) Close() {
 	cm.mutex.RUnlock()
 }
 
-// Cleans up clients and remote connections that have not been used in a while.
-// Blocks until the ClientMap has been closed.
+// Clean up clients and remote connections that have not been used in a while.
+// Blocks until the ClientMap is closed.
 func (cm *ClientMap) idleCleanupLoop() {
 	log.Info().Msg("Starting idle connection handler")
 
-	// Loop forever using a channel that emits every IdleCheckInterval
-	for currentTime := range time.Tick(cm.IdleCheckInterval) {
-		// Stop the idle cleanup goroutine if the proxy stopped
+	ticker := time.NewTicker(cm.IdleCheckInterval)
+	defer ticker.Stop() // prevents the ticker from accumulating if the loop exits via dead
+
+	for currentTime := range ticker.C {
+		// stop the idle cleanup goroutine if the proxy stopped
 		if cm.dead.IsSet() {
 			break
 		}

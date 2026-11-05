@@ -2,8 +2,9 @@ package proxy
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
+	"os"
 	"regexp"
 	"time"
 
@@ -19,6 +20,12 @@ const maxMTU = 1472
 
 var idleCheckInterval = 5 * time.Second
 
+// errorBackoff paces retries in readLoop after a transient processing error,
+// guarding against a hot spin if the listener ever returns without blocking
+// (e.g., closed concurrently). The normal path — a blocking ReadFrom — is
+// unaffected.
+var errorBackoff = 100 * time.Millisecond
+
 type ProxyServer struct {
 	bindAddress         *net.UDPAddr
 	boundPort           uint16
@@ -29,7 +36,7 @@ type ProxyServer struct {
 	clientMap           *clientmap.ClientMap
 	prefs               ProxyPrefs
 	dead                *abool.AtomicBool
-	serverOffline       bool
+	serverOffline       *abool.AtomicBool
 }
 
 type ProxyPrefs struct {
@@ -42,8 +49,13 @@ type ProxyPrefs struct {
 	NumWorkers   uint
 }
 
-var randSource = rand.NewSource(time.Now().UnixNano())
-var serverID = randSource.Int63()
+// serverID is a unique per-instance identifier advertised to clients; it must
+// be freshly derived on every phantom start so restarting doesn't confuse
+// clients that remember the previous ID. Safe under concurrent use:
+// math/rand/v2's top-level functions are thread-safe. (62-bit range —
+// collision probability is negligible, and negative values are impossible
+// unlike rand.Int64().)
+var serverID = rand.Int64N(1 << 62)
 var offlineErrorRegex = regexp.MustCompile("(timeout)|(connection refused)")
 
 func New(prefs ProxyPrefs) (*ProxyServer, error) {
@@ -51,7 +63,7 @@ func New(prefs ProxyPrefs) (*ProxyServer, error) {
 
 	// Randomize port if not provided
 	if bindPort == 0 {
-		bindPort = (uint16(randSource.Int63()) % 14000) + 50000
+		bindPort = uint16(rand.IntN(14000)) + 50000
 	}
 
 	// Format full bind address with port
@@ -67,6 +79,14 @@ func New(prefs ProxyPrefs) (*ProxyServer, error) {
 		return nil, fmt.Errorf("Invalid server address: %s", err)
 	}
 
+	// Reject a missing port outright: a remote address with port 0 would
+	// silently "connect" to an unreachable address (UDP has no handshake,
+	// so this would never error), and phantom would run degraded without
+	// saying so.
+	if remoteServerAddress.Port == 0 {
+		return nil, fmt.Errorf("invalid server address %q: no port specified (use host:port, e.g. 192.168.1.20:19132)", prefs.RemoteServer)
+	}
+
 	return &ProxyServer{
 		bindAddress,
 		bindPort,
@@ -77,7 +97,7 @@ func New(prefs ProxyPrefs) (*ProxyServer, error) {
 		clientmap.New(prefs.IdleTimeout, idleCheckInterval),
 		prefs,
 		abool.New(),
-		false,
+		abool.New(),
 	}, nil
 }
 
@@ -120,6 +140,9 @@ func (proxy *ProxyServer) Start() error {
 		// a safe cast, I promise
 		proxy.server = server.(*net.UDPConn)
 	} else {
+		// Don't leak the ping listeners (and their readLoop goroutines)
+		// that were already started — shut them down on this failure path.
+		proxy.shutdownListeners()
 		return err
 	}
 
@@ -133,12 +156,16 @@ func (proxy *ProxyServer) Start() error {
 }
 
 func (proxy *ProxyServer) Close() {
-	log.Info().Msgf("Stopping proxy server")
+	log.Info().Msg("Stopping proxy server")
 
-	// Stop UDP listeners
-	proxy.server.Close()
-	proxy.pingServer.Close()
-
+	// Shut down UDP listeners (nil-guarded: Start may fail before every
+	// listener is assigned, and Close is still called on interrupt)
+	if proxy.server != nil {
+		proxy.server.Close()
+	}
+	if proxy.pingServer != nil {
+		proxy.pingServer.Close()
+	}
 	if proxy.pingServerV6 != nil {
 		proxy.pingServerV6.Close()
 	}
@@ -150,13 +177,38 @@ func (proxy *ProxyServer) Close() {
 	proxy.dead.Set()
 }
 
-func (proxy *ProxyServer) startWorkers(listener net.PacketConn) {
-	log.Info().Msgf("Starting %d workers", proxy.prefs.NumWorkers)
+// shutdownListeners reverses Start's partial-setup on the failure path so
+// callers don't leak already-bound listeners or the readLoop goroutines
+// attached to them. Setting dead makes the in-flight readLoops exit.
+func (proxy *ProxyServer) shutdownListeners() {
+	proxy.dead.Set()
+	if proxy.pingServerV6 != nil {
+		proxy.pingServerV6.Close()
+		proxy.pingServerV6 = nil
+	}
+	if proxy.pingServer != nil {
+		proxy.pingServer.Close()
+		proxy.pingServer = nil
+	}
+}
 
-	for i := uint(0); i < proxy.prefs.NumWorkers; i++ {
-		if i < proxy.prefs.NumWorkers-1 {
+func (proxy *ProxyServer) startWorkers(listener net.PacketConn) {
+	// Clamp to at least one worker: with NumWorkers == 0, zero workers
+	// would be launched and Start would return a zombie proxy that
+	// listens but never forwards packets.
+	numWorkers := proxy.prefs.NumWorkers
+	if numWorkers == 0 {
+		numWorkers = 1
+	}
+
+	log.Info().Msgf("Starting %d workers", numWorkers)
+
+	for i := uint(0); i < numWorkers; i++ {
+		if i < numWorkers-1 {
 			go proxy.readLoop(listener)
 		} else {
+			// Last worker runs in the current goroutine, so Start()
+			// blocks until the proxy is shut down.
 			proxy.readLoop(listener)
 		}
 	}
@@ -172,7 +224,11 @@ func (proxy *ProxyServer) readLoop(listener net.PacketConn) {
 	for !proxy.dead.IsSet() {
 		err := proxy.processDataFromClients(listener, packetBuffer)
 		if err != nil {
+			// Back off on error to avoid hot-spinning on a sustained
+			// failure (e.g. a flap in remote connection establishment).
+			// The happy path (err == nil) is unaffected — no sleep.
 			log.Warn().Msgf("Error while processing client data: %s", err)
+			time.Sleep(errorBackoff)
 		}
 	}
 
@@ -217,7 +273,7 @@ func (proxy *ProxyServer) processDataFromClients(listener net.PacketConn, packet
 	if packetID := data[0]; packetID == proto.UnconnectedPingID {
 		log.Info().Msgf("Received LAN ping from client: %s", client.String())
 
-		if proxy.serverOffline {
+		if proxy.serverOffline.IsSet() {
 			replyBuffer := proto.OfflinePong
 			replyBytes := proxy.rewriteUnconnectedPong(replyBuffer.Bytes())
 
@@ -247,14 +303,27 @@ func (proxy *ProxyServer) processDataFromServer(remoteConn *net.UDPConn, client 
 
 		// Read error
 		if err != nil {
+			// A read timeout is TRANIENT: the shared conn's read deadline is
+			// advanced by the worker on every forwarded client packet (see
+			// SetReadDeadline below in processDataFromClients). A healthy but
+			// momentarily silent server triggers it (UDPs do not heartbeat),
+			// so it must not tear the connection down or mark the server
+			// offline. Reset the deadline (block infinitely again) and keep
+			// waiting.
+			if os.IsTimeout(err) {
+				log.Warn().Msgf("Server read timed out (transient); keeping connection: %v", err)
+				_ = remoteConn.SetReadDeadline(time.Time{})
+				continue
+			}
+
 			log.Warn().Msgf("%v", err)
 
+			// Mark offline if the failure indicates a connectivity loss
+			// (deduplicated: log warn only on the false->true transition)
 			offlineError := offlineErrorRegex.MatchString(err.Error())
-
-			if offlineError && !proxy.serverOffline {
-				log.Warn().Msgf("Server seems to be offline :(")
-				log.Warn().Msgf("We'll keep trying to connect...")
-				proxy.serverOffline = true
+			if offlineError && proxy.serverOffline.SetToIf(false, true) {
+				log.Warn().Msg("Server seems to be offline :(")
+				log.Warn().Msg("We'll keep trying to connect...")
 			}
 
 			break
@@ -265,9 +334,10 @@ func (proxy *ProxyServer) processDataFromServer(remoteConn *net.UDPConn, client 
 			continue
 		}
 
-		if proxy.serverOffline {
+		// Clear the flag if the server came back online; log only on the
+		// true->false transition (i.e., we recover from the offline state)
+		if proxy.serverOffline.SetToIf(true, false) {
 			log.Info().Msgf("Server is back online!")
-			proxy.serverOffline = false
 		}
 
 		// Resize data to byte count from 'read'
