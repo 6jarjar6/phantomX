@@ -34,7 +34,6 @@ type fakeServer struct {
 	mu    sync.Mutex
 	addr  *net.UDPAddr
 	lc    *net.UDPConn
-	got   map[string]int
 	total int
 	reply bool
 }
@@ -43,7 +42,7 @@ func startFakeServer(t *testing.T, port int) *fakeServer {
 	t.Helper()
 	a, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", port))
 	require.NoError(t, err)
-	fs := &fakeServer{addr: a, got: map[string]int{}, reply: true}
+	fs := &fakeServer{addr: a, reply: true}
 	require.NoError(t, fs.listen())
 	t.Cleanup(fs.stop)
 	return fs
@@ -68,7 +67,6 @@ func (fs *fakeServer) loop(lc *net.UDPConn) {
 		}
 		fs.mu.Lock()
 		fs.total++
-		fs.got[src.(*net.UDPAddr).String()]++
 		reply := fs.reply
 		hasPayload := n > 0 && buf[0] == proto.UnconnectedPingID && reply
 		var ping *proto.UnconnectedPing
@@ -120,31 +118,12 @@ func (fs *fakeServer) SetReply(on bool) {
 	fs.mu.Unlock()
 }
 
-// DistinctSenders counts the distinct proxy-side source addresses, i.e.
-// one per distinct proxy-to-server connection (datagrams from the proxy
-// data listener share a fixed source port; each client connection
-// originates from a new DialUDP ephemeral port).
-func (fs *fakeServer) DistinctSenders() int {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	return len(fs.got)
-}
-
 // Stop kills the fake server (making it a dead port for the proxy).
 func (fs *fakeServer) stop() {
 	if fs.lc != nil {
 		fs.lc.Close()
 		fs.lc = nil
 	}
-}
-
-// Revive re-binds the fake server on the same port (server recovery).
-func (fs *fakeServer) revive() {
-	if fs.lc != nil {
-		return
-	}
-	fs.reply = true
-	_ = fs.listen()
 }
 
 // testClient is a minimal Minecraft-console stand-in: real UDP socket,
@@ -211,6 +190,19 @@ func (tc *testClient) takePong(timeout time.Duration) (pkg *proto.UnconnectedPin
 
 func (tc *testClient) shut() { tc.conn.Close() }
 
+// drainAny discards stray pong replies queued by bringUp, so the
+// subsequent takePong provably reflects a response from the surviving
+// connection (not a leftover from the bootstrap traffic).
+func (tc *testClient) drainAny() {
+	for {
+		select {
+		case <-tc.packets:
+		default:
+			return
+		}
+	}
+}
+
 // bringUp starts a proxy aimed at the fake server and waits (polling with
 // pings) until it demonstrates life by forwarding traffic.
 func bringUp(t *testing.T, fs *fakeServer, prefs ProxyPrefs) (*ProxyServer, *testClient) {
@@ -225,8 +217,19 @@ func bringUp(t *testing.T, fs *fakeServer, prefs ProxyPrefs) (*ProxyServer, *tes
 	}
 	pr, err := New(prefs)
 	require.NoError(t, err)
-	go pr.Start()
+	// Start() is BLOCKING (it drives the readLoop itself; only exits
+	// on error). Launch it in a goroutine, but surface a fast early
+	// failure (e.g., a bind error) directly — the 5s polling loop
+	// below would otherwise swallow it.
+	startErr := make(chan error, 1)
+	go func() { startErr <- pr.Start() }()
 	t.Cleanup(func() { pr.Close() })
+	waitForReady(t, pr, "Start() failed")
+	select {
+	case err := <-startErr:
+		require.FailNow(t, "Start() exited unexpectedly: "+err.Error())
+	default:
+	}
 
 	tc := startTestClient(t)
 	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(pr.boundPort)}
@@ -286,6 +289,7 @@ func TestHappyPath(t *testing.T) {
 	})
 	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(pr.boundPort)}
 
+	tc.drainAny() // Discard stray pongs from bringUp bootstrap traffic
 	tc.sendPing(dst, 1)
 	pkg, ok := tc.takePong(3 * time.Second)
 	require.True(t, ok, "expected a pong from the fake server via the proxy")
@@ -293,9 +297,14 @@ func TestHappyPath(t *testing.T) {
 	assert.Equal(t, "fake motd", pkg.Pong.MOTD)
 	// The proxy rewrites the server ID to its own instance ID.
 	assert.Equal(t, fmt.Sprintf("%d", serverID), pkg.Pong.ServerID)
-	// ...and the port to the proxy's bound port.
-	assert.Equal(t, fmt.Sprintf("%d", pr.boundPort), pkg.Pong.Port4)
-	assert.Equal(t, fmt.Sprintf("%d", pr.boundPort), pkg.Pong.Port6)
+	// ...and the port to the proxy's bound port. Expected value is
+	// derived from the SOCKET itself (white box), not from the field —
+	// so a regression to field 0 (overwrite emitting "0") fails the
+	// comparison, and NotEqual pins the rewrite itself.
+	realPort := fmt.Sprintf("%d", pr.server.LocalAddr().(*net.UDPAddr).Port)
+	assert.Equal(t, realPort, pkg.Pong.Port4, "port4 must be the proxy's real bound port")
+	assert.Equal(t, realPort, pkg.Pong.Port6, "port6 must be the proxy's real bound port")
+	assert.NotEqual(t, "19132", pkg.Pong.Port4, "port must be rewritten away from the fake's advertisement")
 }
 
 // tryTakePong is the non-blocking variant of takePong (for waitFor polling).
@@ -334,13 +343,21 @@ func TestTransientReadTimeoutKeepsConnectionAlive(t *testing.T) {
 		return pr.clientMap.Len()
 	}
 
-	// Repro the production false positive: silence the server, then
-	// forward a ping — the worker sets the shared conn's deadline
-	// (+250ms), the fake never answers, and the reader's pending
+	// Reconstruct the production false positive: silence the server, then
+	// forward a ping — the worker sets the deadline on the shared conn
+	// (+250ms), the fake responds nothing, and the reader's waiting
 	// ReadFrom expires with "i/o timeout".
 	fs.SetReply(false)
+	tc.drainAny() // Discard the stray pong from bringUp, so the survivorship legs aren't contaminated
 	tc.sendPing(dstFor(pr), 2)
-	time.Sleep(400 * time.Millisecond) // let the deadline elapse
+	// Wait until the +serverReadDelay read deadline has actually elapsed.
+	// Polling (rather than a fixed sleep) lets a heavily-loaded host let
+	// the deadline slip past without weakening the transient-timeout
+	// oracle — a 400ms margin covers plausible worker-processing delay.
+	deadline := time.Now().Add(serverReadDelay + 400*time.Millisecond)
+	for time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	// Old code: "i/o timeout" matches the regex -> connection torn down
 	// and server marked OFFLINE. Fixed code: transient -> connection kept.
@@ -358,6 +375,20 @@ func TestTransientReadTimeoutKeepsConnectionAlive(t *testing.T) {
 
 func dstFor(pr *ProxyServer) *net.UDPAddr {
 	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(pr.boundPort)}
+}
+
+// waitForReady blocks until Start() finishes binding (the ready barrier)
+// — synchronized access to boundPort. A Start() that fails early (bad
+// bind) surfaces via the channel inside waitForReady's caller.
+func waitForReady(t *testing.T, pr *ProxyServer, failMsg string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !pr.ready.IsSet() {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: Start() never became ready", failMsg)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -435,12 +466,27 @@ func TestMultiWorkerStillProxies(t *testing.T) {
 	pkg, ok := tc.takePong(3 * time.Second)
 	require.True(t, ok, "expected pong via a 2-worker proxy")
 	assert.Equal(t, "fake motd", pkg.Pong.MOTD)
+
+	// Second phase: NumWorkers:0 hits the clamp (0 → 1 worker). Without
+	// the clamp, a zero-worker proxy is a zombie that never forwards
+	// — this case is what actually pins the clamp branch.
+	fs2 := startFakeServer(t, pickFreePort(t))
+	pr2, tc2 := bringUp(t, fs2, ProxyPrefs{
+		IdleTimeout: 20 * time.Second,
+		NumWorkers:  0,
+	})
+	tc2.drainAny()
+	tc2.sendPing(dstFor(pr2), 1)
+	pkg2, ok := tc2.takePong(3 * time.Second)
+	require.True(t, ok, "expected pong via a clamped-to-one-worker proxy")
+	assert.Equal(t, "fake motd", pkg2.Pong.MOTD)
 }
 
 // ---------------------------------------------------------------------------
-// Cycle 6 — startup bind failure: Start() errors and the already-bound ping
-// listener is released (Group 4 leak fix). Verified by being able to
-// re-bind that exact ping port on a second proxy.
+// Cycle 6 — startup bind failure: Start() errors, the ping listener is
+// RELEASED (Group-4 leak fix), and Close() stays safe. Leak proof:
+// rebind the ping port BEFORE Close() — Close would mask the leak
+// (it closes any assigned pingServer).
 // ---------------------------------------------------------------------------
 
 func TestStartupBindFailureReleasesResources(t *testing.T) {
@@ -466,12 +512,125 @@ func TestStartupBindFailureReleasesResources(t *testing.T) {
 
 	err = pr.Start()
 	require.Error(t, err, "Start must fail when the game port is held")
-	pr.Close() // Close on a failed Start must be safe (nil guards)
 
-	// The ping listener was bound BEFORE the failure — if it leaked,
-	// rebinding it here would fail. Free it (holder) and rebind both.
+	// Oracle BEFORE Close(): if the failed Start leaked the ping listener,
+	// rebinding it here fails. (White box: the fix also nils the field.)
+	require.Nil(t, pr.pingServer, "failed Start must nil the ping listener")
 	holder.Close()
 	leakCheck, err := net.ListenUDP("udp", &net.UDPAddr{Port: int(pingPort)})
 	require.NoError(t, err, "ping port must be free after failed Start (no leak)")
 	leakCheck.Close()
+
+	// Close on a failed Start must be safe (nil guards, no panic).
+	pr.Close()
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 7 — IPv6 dual-stack: with EnableIPv6, Start() binds an additional
+// IPv6 ping listener (port 19133 default) alongside the v4 one, the proxy
+// still proxies normally, and Close() tears the IPv6 listener down without
+// panicking.
+// ---------------------------------------------------------------------------
+
+func TestIPv6DualStackBindsAndProxies(t *testing.T) {
+	fs := startFakeServer(t, pickFreePort(t))
+
+	pr, err := New(ProxyPrefs{
+		BindAddress:  "127.0.0.1",
+		BindPort:     uint16(pickFreePort(t)),
+		RemoteServer: fs.Address().String(),
+		IdleTimeout:  20 * time.Second,
+		EnableIPv6:   true,
+		PingPort:     uint16(pickFreePort(t)),
+		PingPortV6:   uint16(pickFreePort(t)),
+	})
+	require.NoError(t, err)
+
+	// Start() is blocking (last worker runs in-goroutine); surface a fast
+	// early bind failure directly instead of letting it hang.
+	startErr := make(chan error, 1)
+	go func() { startErr <- pr.Start() }()
+	t.Cleanup(func() { pr.Close() })
+	waitForReady(t, pr, "IPv6 Start() failed")
+	select {
+	case err := <-startErr:
+		require.FailNow(t, "IPv6 Start() exited unexpectedly: "+err.Error())
+	default:
+	}
+
+	// The IPv6 ping listener must have bound (Start's EnableIPv6 path),
+	// and the v4 listener alongside it.
+	require.NotNil(t, pr.pingServerV6, "IPv6 ping listener must bind when EnableIPv6 is set")
+	require.NotNil(t, pr.pingServer, "v4 ping listener must also bind")
+
+	// End-to-end: a normal ping over the v4 port still proxies through an
+	// IPv6-enabled proxy.
+	tc := startTestClient(t)
+	tc.drainAny()
+	tc.sendPing(dstFor(pr), 1)
+	pkg, ok := tc.takePong(3 * time.Second)
+	require.True(t, ok, "expected pong over IPv6-enabled proxy")
+	assert.Equal(t, "fake motd", pkg.Pong.MOTD)
+
+	// Close must tear down the IPv6 listener without panicking.
+	pr.Close()
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 8 — offline pong: when the backend is marked offline, a client LAN
+// ping is answered with the proxy's canned offline pong (not the real
+// server's), so the console shows "server offline" instead of hanging.
+// ---------------------------------------------------------------------------
+
+func TestOfflinePongServedWhenServerDown(t *testing.T) {
+	// Fake won't respond, so the ONLY pong the client can receive is the
+	// proxy's canned offline pong — making the oracle deterministic.
+	fs := startFakeServer(t, pickFreePort(t))
+	fs.SetReply(false)
+
+	pr, tc := bringUp(t, fs, ProxyPrefs{IdleTimeout: 20 * time.Second})
+
+	// Simulate the backend being detected offline.
+	pr.serverOffline.Set()
+
+	tc.drainAny()
+	tc.sendPing(dstFor(pr), 1)
+	pkg, ok := tc.takePong(3 * time.Second)
+	require.True(t, ok, "expected offline pong from the proxy")
+
+	// The offline pong is a distinctive, canned packet — verify it is the
+	// offline one, not the fake server's real pong.
+	assert.Equal(t, "phantom §cServer offline", pkg.Pong.MOTD)
+	assert.Equal(t, "390", pkg.Pong.ProtocolVersion)
+	assert.Equal(t, "1.14.60", pkg.Pong.Version)
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 9 — server recovery: once the backend responds again, the offline
+// flag is cleared and traffic flows through normally.
+// ---------------------------------------------------------------------------
+
+func TestServerRecoveryClearsOfflineFlag(t *testing.T) {
+	fs := startFakeServer(t, pickFreePort(t))
+
+	pr, tc := bringUp(t, fs, ProxyPrefs{IdleTimeout: 20 * time.Second})
+
+	// Mark the backend offline, then have it come back.
+	pr.serverOffline.Set()
+
+	// The fake resumes; a ping makes it respond, which the proxy reads on
+	// the server-reading goroutine and uses to clear the offline flag.
+	fs.SetReply(true)
+	tc.drainAny()
+	tc.sendPing(dstFor(pr), 1)
+
+	// The client receives the server's real pong (proving recovery forwarded
+	// live traffic, not the canned offline pong).
+	waitFor(t, "recovery pong", 3*time.Second, func() bool {
+		p := tc.tryTakePong()
+		return p != nil && p.Pong.MOTD == "fake motd"
+	})
+
+	// Recovery cleared the offline flag.
+	assert.False(t, pr.serverOffline.IsSet(), "server must clear offline state after responding")
 }

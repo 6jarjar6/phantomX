@@ -55,6 +55,7 @@ type ProxyServer struct {
 	prefs               ProxyPrefs
 	dead                *abool.AtomicBool
 	serverOffline       *abool.AtomicBool
+	ready               *abool.AtomicBool
 }
 
 type ProxyPrefs struct {
@@ -122,6 +123,7 @@ func New(prefs ProxyPrefs) (*ProxyServer, error) {
 		prefs,
 		abool.New(),
 		abool.New(),
+		abool.New(),
 	}, nil
 }
 
@@ -173,7 +175,16 @@ func (proxy *ProxyServer) Start() error {
 	log.Info().Msgf("Binding proxy server to: %v", proxy.bindAddress)
 	if server, err := reuse.ListenPacket(network, proxy.bindAddress.String()); err == nil {
 		// a safe cast, I promise
-		proxy.server = server.(*net.UDPConn)
+		serverConn := server.(*net.UDPConn)
+		proxy.server = serverConn
+		// Capture the actual bound port (ephemeral when BindPort == 0):
+		// without this, the port-overwrite below rewrites every pong's
+		// advertised port to "0".
+		proxy.boundPort = uint16(serverConn.LocalAddr().(*net.UDPAddr).Port)
+		// Ready barrier: tests (and anyone awaiting boundPort) wait on this
+		// before touching the port — a plain read would race the Start()
+		// goroutine under -race.
+		proxy.ready.SetToIf(false, true)
 	} else {
 		// Don't leak the ping listeners (and their readLoop goroutines)
 		// that were already started — shut them down on this failure path.
